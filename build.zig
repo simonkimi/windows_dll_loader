@@ -5,17 +5,9 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    const ptrModule = b.addModule("ptr", .{
-        .root_source_file = b.path("src/ptr.zig"),
-        .target = target,
-    });
-
     const dllLoaderModule = b.addModule("dll_loader", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .imports = &.{
-            .{ .name = "ptr", .module = ptrModule },
-        },
     });
 
     const exe = b.addExecutable(.{
