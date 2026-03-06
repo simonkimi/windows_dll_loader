@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const mem = @import("mem");
 
 const windows = @cImport({
     @cDefine("UNICODE", "1");
@@ -52,6 +53,11 @@ fn getPageProtectFlags(characteristics: windows.DWORD) windows.DWORD {
     return protect;
 }
 
+const RelocItem = packed struct {
+    offset: u12,
+    type: u4,
+};
+
 pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     // 加载文件
     const file = std.fs.cwd().openFile(path, .{}) catch return LoadDllError.InvalidFile;
@@ -70,7 +76,7 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     }
     const ntHeadersOffset: usize = @intCast(dosHeader.*.e_lfanew);
 
-    const ntHeaders: *windows.IMAGE_NT_HEADERS = @ptrCast(@alignCast(peFile.ptr + ntHeadersOffset + @sizeOf(windows.IMAGE_NT_HEADERS)));
+    const ntHeaders: *windows.IMAGE_NT_HEADERS = @ptrCast(@alignCast(peFile.ptr + ntHeadersOffset));
     if (ntHeaders.Signature != windows.IMAGE_NT_SIGNATURE) {
         return LoadDllError.InvalidNtSignature;
     }
@@ -78,13 +84,14 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     const pageAllocator = std.heap.page_allocator;
     const peMemory = pageAllocator.alloc(u8, ntHeaders.OptionalHeader.SizeOfImage) catch return LoadDllError.OutOfMemory;
 
+
     // 复制dos头与nt头
     const headerSize = ntHeaders.OptionalHeader.SizeOfHeaders;
-    @memcpy(peMemory[0..headerSize], peFile[0..headerSize]);
+    mem.memcpy(peMemory, peFile, headerSize);
 
     // 复制节区数据
     const sectionHeaders: [*]const windows.IMAGE_SECTION_HEADER = @ptrCast(@alignCast(peFile.ptr + ntHeadersOffset + @sizeOf(windows.IMAGE_NT_HEADERS)));
-    const sectionHeadersSlice: []const windows.IMAGE_SECTION_HEADER = @ptrCast(sectionHeaders[0..ntHeaders.FileHeader.NumberOfSections]);
+    const sectionHeadersSlice: []const windows.IMAGE_SECTION_HEADER = sectionHeaders[0..ntHeaders.FileHeader.NumberOfSections];
     for (sectionHeadersSlice) |section| {
         const fileOffset = section.PointerToRawData;
         const memoryOffset = section.VirtualAddress;
@@ -95,21 +102,39 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
 
         // 拷贝节数据到内存
         if (characteristics & (windows.IMAGE_SCN_CNT_CODE | windows.IMAGE_SCN_CNT_INITIALIZED_DATA) != 0) {
-            @memcpy(peMemory[memoryOffset..(memoryOffset + dataSize)], peFile[fileOffset..(fileOffset + dataSize)]);
+            mem.memcpy(&peMemory[memoryOffset], &peFile[fileOffset], dataSize);
             if (memSize > dataSize) {
-                @memset(peMemory[memoryOffset + dataSize .. (memoryOffset + memSize)], 0);
+                mem.memset(&peMemory[memoryOffset + dataSize], 0, memSize - dataSize);
             }
         } else if (characteristics & windows.IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0) {
-            @memset(peMemory[memoryOffset..(memoryOffset + memSize)], 0);
+            mem.memset(&peMemory[memoryOffset], 0, memSize);
         } else {
             continue;
         }
 
         // 设置页保护
-        const protect = getPageProtectFlags(characteristics);
-        const result = windows.VirtualProtect(peMemory.ptr + memoryOffset, memSize, protect, null);
-        if (result != windows.TRUE) {
-            return LoadDllError.VirtualProtectFailed;
+        // const protect = getPageProtectFlags(characteristics);
+        // const result = windows.VirtualProtect(peMemory.ptr + memoryOffset, memSize, protect, null);
+        // if (result != windows.TRUE) {
+        //     return LoadDllError.VirtualProtectFailed;
+        // }
+    }
+
+    // 修补重定位表
+    const relocAddress = ntHeaders.OptionalHeader.DataDirectory[windows.IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+    var relocOffset: usize = 0;
+
+    while (true) {
+        const relocBaseData: *windows.IMAGE_BASE_RELOCATION = @ptrCast(@alignCast(peMemory.ptr + relocAddress + relocOffset));
+        if (relocBaseData.SizeOfBlock == 0) break;
+        relocOffset += relocBaseData.SizeOfBlock;
+
+        const itemCount = (relocBaseData.SizeOfBlock - @sizeOf(windows.IMAGE_BASE_RELOCATION)) / @sizeOf(windows.WORD);
+        const relocItems: [*]windows.WORD = @ptrCast(@alignCast(peMemory.ptr + relocAddress + @sizeOf(windows.IMAGE_BASE_RELOCATION)));
+        const relocItemsSlice: []windows.WORD = relocItems[0..itemCount];
+        for (relocItemsSlice) |*relocWord| {
+            const relocItem: *RelocItem = @ptrCast(relocWord);
+            std.debug.print("relocType: {x}, relocOffset: {x}\n", .{ relocItem.type, relocItem.offset });
         }
     }
 

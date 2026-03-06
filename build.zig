@@ -5,9 +5,17 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    const memModule = b.addModule("mem", .{
+        .root_source_file = b.path("src/mem.zig"),
+        .target = target,
+    });
+
     const dllLoaderModule = b.addModule("dll_loader", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "mem", .module = memModule },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -20,6 +28,7 @@ pub fn build(b: *std.Build) void {
 
             .imports = &.{
                 .{ .name = "dll_loader", .module = dllLoaderModule },
+                .{ .name = "mem", .module = memModule },
             },
             .link_libc = true,
         }),
