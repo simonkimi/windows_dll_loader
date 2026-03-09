@@ -13,4 +13,5 @@ pub fn main() !void {
         return err;
     };
     defer dllHandle.deinit();
+    std.debug.print("DLL loaded successfully\n", .{});
 }

@@ -13,6 +13,8 @@ const DllHandle = struct {
     memory: []u8,
 
     pub fn deinit(self: *@This()) void {
+        var old: windows.DWORD = 0;
+        _ = windows.VirtualProtect(self.memory.ptr, self.memory.len, windows.PAGE_READWRITE, &old);
         self.allocator.free(self.memory);
     }
 };
@@ -53,9 +55,18 @@ fn getPageProtectFlags(characteristics: windows.DWORD) windows.DWORD {
     return protect;
 }
 
-const RelocItem = packed struct {
-    offset: u12,
-    type: u4,
+const RelocItem = union {
+    value: u16,
+    item: packed struct {
+        offset: u12,
+        type: u4,
+    },
+};
+
+const SectionProtectValue = struct {
+    protect: windows.DWORD,
+    address: [*]u8,
+    size: usize,
 };
 
 pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
@@ -70,7 +81,7 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
 
     // 加载pe
     const dosHeader: *windows.IMAGE_DOS_HEADER = @ptrCast(@alignCast(peFile.ptr));
-    std.debug.print("e_magic: {x}\n", .{dosHeader.*.e_magic});
+    std.debug.print("e_magic: 0x{x}\n", .{dosHeader.*.e_magic});
     if (dosHeader.*.e_magic != windows.IMAGE_DOS_SIGNATURE) {
         return LoadDllError.InvalidDosSignature;
     }
@@ -83,11 +94,14 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
 
     const pageAllocator = std.heap.page_allocator;
     const peMemory = pageAllocator.alloc(u8, ntHeaders.OptionalHeader.SizeOfImage) catch return LoadDllError.OutOfMemory;
+    const delta: i64 = @intCast(@intFromPtr(peMemory.ptr) - ntHeaders.OptionalHeader.ImageBase);
 
-
-    // 复制dos头与nt头
+    // 复制PE头
     const headerSize = ntHeaders.OptionalHeader.SizeOfHeaders;
     mem.memcpy(peMemory, peFile, headerSize);
+
+    var sectionProtectList: std.ArrayList(SectionProtectValue) = .empty;
+    defer sectionProtectList.deinit(allocator);
 
     // 复制节区数据
     const sectionHeaders: [*]const windows.IMAGE_SECTION_HEADER = @ptrCast(@alignCast(peFile.ptr + ntHeadersOffset + @sizeOf(windows.IMAGE_NT_HEADERS)));
@@ -98,26 +112,20 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
         const dataSize = section.SizeOfRawData;
         const memSize = section.Misc.VirtualSize;
 
-        const characteristics = section.Characteristics;
-
-        // 拷贝节数据到内存
-        if (characteristics & (windows.IMAGE_SCN_CNT_CODE | windows.IMAGE_SCN_CNT_INITIALIZED_DATA) != 0) {
+        if (dataSize > 0) {
             mem.memcpy(&peMemory[memoryOffset], &peFile[fileOffset], dataSize);
-            if (memSize > dataSize) {
-                mem.memset(&peMemory[memoryOffset + dataSize], 0, memSize - dataSize);
-            }
-        } else if (characteristics & windows.IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0) {
-            mem.memset(&peMemory[memoryOffset], 0, memSize);
-        } else {
-            continue;
+        }
+        if (memSize > dataSize) {
+            mem.memset(&peMemory[memoryOffset + dataSize], 0, memSize - dataSize);
         }
 
-        // 设置页保护
-        // const protect = getPageProtectFlags(characteristics);
-        // const result = windows.VirtualProtect(peMemory.ptr + memoryOffset, memSize, protect, null);
-        // if (result != windows.TRUE) {
-        //     return LoadDllError.VirtualProtectFailed;
-        // }
+        // 设置节区保护
+        const protect = getPageProtectFlags(section.Characteristics);
+        sectionProtectList.append(allocator, SectionProtectValue{
+            .protect = protect,
+            .address = peMemory.ptr + memoryOffset,
+            .size = memSize,
+        }) catch return LoadDllError.OutOfMemory;
     }
 
     // 修补重定位表
@@ -125,16 +133,39 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     var relocOffset: usize = 0;
 
     while (true) {
-        const relocBaseData: *windows.IMAGE_BASE_RELOCATION = @ptrCast(@alignCast(peMemory.ptr + relocAddress + relocOffset));
+        const relocBaseData: *const windows.IMAGE_BASE_RELOCATION = @ptrCast(@alignCast(peMemory.ptr + relocAddress + relocOffset));
+        std.debug.print("relocBaseData: 0x{x}, SizeOfBlock: 0x{x}, VirtualAddress: 0x{x}\n", .{ @intFromPtr(relocBaseData), relocBaseData.SizeOfBlock, relocBaseData.VirtualAddress });
         if (relocBaseData.SizeOfBlock == 0) break;
         relocOffset += relocBaseData.SizeOfBlock;
 
         const itemCount = (relocBaseData.SizeOfBlock - @sizeOf(windows.IMAGE_BASE_RELOCATION)) / @sizeOf(windows.WORD);
-        const relocItems: [*]windows.WORD = @ptrCast(@alignCast(peMemory.ptr + relocAddress + @sizeOf(windows.IMAGE_BASE_RELOCATION)));
+        const relocItems: [*]windows.WORD = @ptrFromInt(@intFromPtr(relocBaseData) + @sizeOf(windows.IMAGE_BASE_RELOCATION));
         const relocItemsSlice: []windows.WORD = relocItems[0..itemCount];
-        for (relocItemsSlice) |*relocWord| {
-            const relocItem: *RelocItem = @ptrCast(relocWord);
-            std.debug.print("relocType: {x}, relocOffset: {x}\n", .{ relocItem.type, relocItem.offset });
+        for (relocItemsSlice) |relocWord| {
+            const relocItem: *const RelocItem = @ptrCast(&relocWord);
+            const patchAddr = peMemory.ptr + relocBaseData.VirtualAddress + relocItem.item.offset;
+            if (relocItem.item.type == windows.IMAGE_REL_BASED_DIR64) {
+                const ptr: *u64 = @ptrCast(@alignCast(patchAddr));
+                const newAddr = @as(i128, ptr.*) + delta;
+                const asUnsigned: u128 = @bitCast(newAddr);
+                ptr.* = @truncate(asUnsigned);
+            } else if (relocItem.item.type == windows.IMAGE_REL_BASED_HIGHLOW and ntHeaders.OptionalHeader.Magic == windows.IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+                const ptr: *u32 = @ptrCast(@alignCast(patchAddr));
+                const newAddr = @as(i64, ptr.*) + delta;
+                const asUnsigned: u64 = @bitCast(newAddr);
+                ptr.* = @truncate(asUnsigned);
+            }
+        }
+    }
+
+    // 恢复节区保护
+    for (sectionProtectList.items) |sectionProtect| {
+        var oldProtect: windows.DWORD = 0;
+        const result = windows.VirtualProtect(sectionProtect.address, sectionProtect.size, sectionProtect.protect, &oldProtect);
+        if (result != windows.TRUE) {
+            const lastError = windows.GetLastError();
+            std.debug.print("VirtualProtect failed: 0x{x}\n", .{lastError});
+            return LoadDllError.VirtualProtectFailed;
         }
     }
 

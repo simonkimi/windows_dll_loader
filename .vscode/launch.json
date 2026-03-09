@@ -1,0 +1,22 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug dll_loader",
+            "program": "${workspaceFolder}/zig-out/bin/dll_loader.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "zig build"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug (no build)",
+            "program": "${workspaceFolder}/zig-out/bin/dll_loader.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
