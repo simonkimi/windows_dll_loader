@@ -199,20 +199,29 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
         const importDesc = importDescriptor[i];
         i += 1;
         if (importDesc.OriginalFirstThunk == 0) break;
-        const iatThunk: [*]const windows.ULONGLONG = @ptrCast(@alignCast(peMemory.ptr + importDesc.FirstThunk));
-        var j: usize = 0;
+
+        const thunk_rva32: windows.DWORD =
+            if (importDesc.OriginalFirstThunk != 0)
+                importDesc.OriginalFirstThunk
+            else
+                importDesc.FirstThunk;
+
+        var thunkOffset: usize = thunk_rva32;
         while (true) {
-            const iatThunkItem = iatThunk[j];
-            j += 1;
-            if (iatThunkItem == 0) break;
-            if (windows.IMAGE_SNAP_BY_ORDINAL(iatThunkItem)) {
-                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(iatThunkItem);
+            const thunkItem: *align(1) windows.ULONGLONG = @ptrCast(@alignCast(peMemory.ptr + thunkOffset));
+            if (thunkItem.* == 0) break;
+            if (windows.IMAGE_SNAP_BY_ORDINAL(thunkItem.*)) {
+                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(thunkItem.*);
                 std.debug.print("Import by ordinal: {}\n", .{ordinal});
             } else {
-                const importName: *const windows.IMAGE_IMPORT_BY_NAME = @ptrCast(@alignCast(peMemory.ptr + iatThunkItem));
-                const importNameStr: [*:0]const u8 = @ptrCast(&importName.Name);
-                std.debug.print("Import by name: {s}\n", .{importNameStr});
+                const rva: usize = @intCast(thunkItem.* & 0xFFFF_FFFF);
+                if (rva > ntHeaders.OptionalHeader.SizeOfImage) {
+                    continue;
+                }
+                const namePtr: [*:0]u8 = @ptrCast(@alignCast(peMemory.ptr + rva + 2));
+                std.debug.print("Import by name: {s}\n", .{namePtr});
             }
+            thunkOffset += @sizeOf(windows.ULONGLONG);
         }
     }
 
