@@ -67,6 +67,14 @@ const SectionProtectValue = struct {
     size: usize,
 };
 
+const ImageImportDescriptor = packed struct {
+    OriginalFirstThunk: windows.DWORD,
+    TimeDateStamp: windows.DWORD,
+    ForwarderChain: windows.DWORD,
+    Name: windows.DWORD,
+    FirstThunk: windows.DWORD,
+};
+
 pub fn getLoadedDll() void {
     const currentProcess: windows.HANDLE = windows.GetCurrentProcess();
 
@@ -110,7 +118,7 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     if (dosHeader.*.e_magic != windows.IMAGE_DOS_SIGNATURE) {
         return LoadDllError.InvalidDosSignature;
     }
-    const ntHeadersOffset: usize = @intCast(dosHeader.*.e_lfanew);
+    const ntHeadersOffset: usize = @intCast(dosHeader.e_lfanew);
 
     const ntHeaders: *windows.IMAGE_NT_HEADERS = @ptrCast(@alignCast(peFile.ptr + ntHeadersOffset));
     if (ntHeaders.Signature != windows.IMAGE_NT_SIGNATURE) {
@@ -179,6 +187,31 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
                 const newAddr = @as(i64, ptr.*) + delta;
                 const asUnsigned: u64 = @bitCast(newAddr);
                 ptr.* = @truncate(asUnsigned);
+            }
+        }
+    }
+
+    // 修补导入表
+    const importAddress = ntHeaders.OptionalHeader.DataDirectory[windows.IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    const importDescriptor: [*]const ImageImportDescriptor = @ptrCast(@alignCast(peMemory.ptr + importAddress));
+    var i: usize = 0;
+    while (true) {
+        const importDesc = importDescriptor[i];
+        i += 1;
+        if (importDesc.OriginalFirstThunk == 0) break;
+        const iatThunk: [*]const windows.ULONGLONG = @ptrCast(@alignCast(peMemory.ptr + importDesc.FirstThunk));
+        var j: usize = 0;
+        while (true) {
+            const iatThunkItem = iatThunk[j];
+            j += 1;
+            if (iatThunkItem == 0) break;
+            if (windows.IMAGE_SNAP_BY_ORDINAL(iatThunkItem)) {
+                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(iatThunkItem);
+                std.debug.print("Import by ordinal: {}\n", .{ordinal});
+            } else {
+                const importName: *const windows.IMAGE_IMPORT_BY_NAME = @ptrCast(@alignCast(peMemory.ptr + iatThunkItem));
+                const importNameStr: [*:0]const u8 = @ptrCast(&importName.Name);
+                std.debug.print("Import by name: {s}\n", .{importNameStr});
             }
         }
     }
