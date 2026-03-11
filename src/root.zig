@@ -6,6 +6,7 @@ const windows = @cImport({
     @cDefine("UNICODE", "1");
     @cDefine("_UNICODE", "1");
     @cInclude("windows.h");
+    @cInclude("psapi.h");
 });
 
 const DllHandle = struct {
@@ -55,12 +56,9 @@ fn getPageProtectFlags(characteristics: windows.DWORD) windows.DWORD {
     return protect;
 }
 
-const RelocItem = union {
-    value: u16,
-    item: packed struct {
-        offset: u12,
-        type: u4,
-    },
+const RelocItem = packed struct {
+    offset: u12,
+    type: u4,
 };
 
 const SectionProtectValue = struct {
@@ -68,6 +66,33 @@ const SectionProtectValue = struct {
     address: [*]u8,
     size: usize,
 };
+
+pub fn getLoadedDll() void {
+    const currentProcess: windows.HANDLE = windows.GetCurrentProcess();
+
+    var modules: [1024]windows.HMODULE = undefined;
+    @memset(&modules, 0);
+    var cbNeeded: windows.DWORD = 0;
+    const result = windows.EnumProcessModules(currentProcess, &modules, @sizeOf(@TypeOf(modules)), &cbNeeded);
+    if (result != windows.TRUE) {
+        const lastError = windows.GetLastError();
+        std.debug.print("EnumProcessModules failed: 0x{x}\n", .{lastError});
+        return;
+    }
+
+    const moduleCount = cbNeeded / @sizeOf(windows.HMODULE);
+    var pathBuffer: [100]u8 = undefined;
+    for (0..moduleCount) |i| {
+        const module = modules[i];
+        const path = windows.GetModuleFileNameExA(currentProcess, module, &pathBuffer, 100);
+        if (path == 0) {
+            const lastError = windows.GetLastError();
+            std.debug.print("GetModuleFileNameExW failed: 0x{x}\n", .{lastError});
+            continue;
+        }
+        std.debug.print("Module {}: {s}\n", .{ i, pathBuffer[0..path] });
+    }
+}
 
 pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     // 加载文件
@@ -143,13 +168,13 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
         const relocItemsSlice: []windows.WORD = relocItems[0..itemCount];
         for (relocItemsSlice) |relocWord| {
             const relocItem: *const RelocItem = @ptrCast(&relocWord);
-            const patchAddr = peMemory.ptr + relocBaseData.VirtualAddress + relocItem.item.offset;
-            if (relocItem.item.type == windows.IMAGE_REL_BASED_DIR64) {
+            const patchAddr = peMemory.ptr + relocBaseData.VirtualAddress + relocItem.offset;
+            if (relocItem.type == windows.IMAGE_REL_BASED_DIR64) {
                 const ptr: *u64 = @ptrCast(@alignCast(patchAddr));
                 const newAddr = @as(i128, ptr.*) + delta;
                 const asUnsigned: u128 = @bitCast(newAddr);
                 ptr.* = @truncate(asUnsigned);
-            } else if (relocItem.item.type == windows.IMAGE_REL_BASED_HIGHLOW and ntHeaders.OptionalHeader.Magic == windows.IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+            } else if (relocItem.type == windows.IMAGE_REL_BASED_HIGHLOW and ntHeaders.OptionalHeader.Magic == windows.IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
                 const ptr: *u32 = @ptrCast(@alignCast(patchAddr));
                 const newAddr = @as(i64, ptr.*) + delta;
                 const asUnsigned: u64 = @bitCast(newAddr);

@@ -8,6 +8,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    dllLoader.getLoadedDll();
+
     var dllHandle = dllLoader.loadDll(allocator, dll) catch |err| {
         std.debug.print("Error loading DLL: {}\n", .{err});
         return err;
