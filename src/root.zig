@@ -2,12 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const mem = @import("mem");
 
-const windows = @cImport({
-    @cDefine("UNICODE", "1");
-    @cDefine("_UNICODE", "1");
-    @cInclude("windows.h");
-    @cInclude("psapi.h");
-});
+const pe = @import("pe");
+const windows = pe.windows;
 
 const DllHandle = struct {
     allocator: Allocator,
@@ -56,25 +52,6 @@ fn getPageProtectFlags(characteristics: windows.DWORD) windows.DWORD {
     return protect;
 }
 
-const RelocItem = packed struct {
-    offset: u12,
-    type: u4,
-};
-
-const SectionProtectValue = struct {
-    protect: windows.DWORD,
-    address: [*]u8,
-    size: usize,
-};
-
-const ImageImportDescriptor = packed struct {
-    OriginalFirstThunk: windows.DWORD,
-    TimeDateStamp: windows.DWORD,
-    ForwarderChain: windows.DWORD,
-    Name: windows.DWORD,
-    FirstThunk: windows.DWORD,
-};
-
 pub fn getLoadedDll() void {
     const currentProcess: windows.HANDLE = windows.GetCurrentProcess();
 
@@ -101,6 +78,12 @@ pub fn getLoadedDll() void {
         std.debug.print("Module {}: {s}\n", .{ i, pathBuffer[0..path] });
     }
 }
+
+const SectionProtectValue = struct {
+    protect: windows.DWORD,
+    address: [*]u8,
+    size: usize,
+};
 
 pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
     // 加载文件
@@ -175,7 +158,7 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
         const relocItems: [*]windows.WORD = @ptrFromInt(@intFromPtr(relocBaseData) + @sizeOf(windows.IMAGE_BASE_RELOCATION));
         const relocItemsSlice: []windows.WORD = relocItems[0..itemCount];
         for (relocItemsSlice) |relocWord| {
-            const relocItem: *const RelocItem = @ptrCast(&relocWord);
+            const relocItem: *const pe.RelocItem = @ptrCast(&relocWord);
             const patchAddr = peMemory.ptr + relocBaseData.VirtualAddress + relocItem.offset;
             if (relocItem.type == windows.IMAGE_REL_BASED_DIR64) {
                 const ptr: *u64 = @ptrCast(@alignCast(patchAddr));
@@ -193,12 +176,14 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
 
     // 修补导入表
     const importAddress = ntHeaders.OptionalHeader.DataDirectory[windows.IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    const importDescriptor: [*]const ImageImportDescriptor = @ptrCast(@alignCast(peMemory.ptr + importAddress));
-    var i: usize = 0;
-    while (true) {
-        const importDesc = importDescriptor[i];
-        i += 1;
+    const importDescriptors: [*]const pe.ImageImportDescriptor = @ptrCast(@alignCast(peMemory.ptr + importAddress));
+    var importDescriptorIndex: usize = 0;
+    while (true) : (importDescriptorIndex += 1) {
+        const importDesc = importDescriptors[importDescriptorIndex];
         if (importDesc.OriginalFirstThunk == 0) break;
+
+        const name: [*:0]u8 = @ptrCast(@alignCast(peMemory.ptr + importDesc.Name));
+        std.debug.print("Import name: {s}\n", .{name});
 
         const thunk_rva32: windows.DWORD =
             if (importDesc.OriginalFirstThunk != 0)
@@ -206,22 +191,21 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
             else
                 importDesc.FirstThunk;
 
-        var thunkOffset: usize = thunk_rva32;
-        while (true) {
-            const thunkItem: *align(1) windows.ULONGLONG = @ptrCast(@alignCast(peMemory.ptr + thunkOffset));
-            if (thunkItem.* == 0) break;
-            if (windows.IMAGE_SNAP_BY_ORDINAL(thunkItem.*)) {
-                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(thunkItem.*);
-                std.debug.print("Import by ordinal: {}\n", .{ordinal});
+        const thunkArrayPtr: [*]const pe.ImageThunkData = @ptrCast(@alignCast(peMemory.ptr + thunk_rva32));
+        var thunkArrayIndex: usize = 0;
+        while (true) : (thunkArrayIndex += 1) {
+            const thunkItem = thunkArrayPtr[thunkArrayIndex];
+            if (thunkItem.Function == 0) break;
+
+            if (windows.IMAGE_SNAP_BY_ORDINAL(thunkItem.Function)) {
+                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(thunkItem.Function);
+                std.debug.print("   Import by ordinal: {}\n", .{ordinal});
             } else {
-                const rva: usize = @intCast(thunkItem.* & 0xFFFF_FFFF);
-                if (rva > ntHeaders.OptionalHeader.SizeOfImage) {
-                    continue;
-                }
-                const namePtr: [*:0]u8 = @ptrCast(@alignCast(peMemory.ptr + rva + 2));
-                std.debug.print("Import by name: {s}\n", .{namePtr});
+                const rva: usize = @intCast(thunkItem.AddressOfData & 0xFFFF_FFFF);
+                const importByName: *const pe.ImageImportByName = @ptrCast(@alignCast(peMemory.ptr + rva));
+                const namePtr: [*:0]const u8 = @ptrCast(&importByName.Name);
+                std.debug.print("   Import by name: {s} original hint: {}\n", .{ namePtr, importByName.Hint });
             }
-            thunkOffset += @sizeOf(windows.ULONGLONG);
         }
     }
 

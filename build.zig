@@ -10,11 +10,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const peModule = b.addModule("pe", .{
+        .root_source_file = b.path("src/pe.zig"),
+        .target = target,
+    });
+
     const dllLoaderModule = b.addModule("dll_loader", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "mem", .module = memModule },
+            .{ .name = "pe", .module = peModule },
         },
     });
 
