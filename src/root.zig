@@ -22,6 +22,7 @@ const LoadDllError = error{
     InvalidNtSignature,
     OutOfMemory,
     VirtualProtectFailed,
+    LoadLibraryFailed,
 };
 
 fn getPageProtectFlags(characteristics: windows.DWORD) windows.DWORD {
@@ -176,35 +177,54 @@ pub fn loadDll(allocator: Allocator, path: []const u8) LoadDllError!DllHandle {
 
     // 修补导入表
     const importAddress = ntHeaders.OptionalHeader.DataDirectory[windows.IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    const importDescriptors: [*]const pe.ImageImportDescriptor = @ptrCast(@alignCast(peMemory.ptr + importAddress));
-    var importDescriptorIndex: usize = 0;
-    while (true) : (importDescriptorIndex += 1) {
-        const importDesc = importDescriptors[importDescriptorIndex];
+    var importDescPtr: [*]const pe.ImageImportDescriptor = @ptrCast(@alignCast(peMemory.ptr + importAddress));
+    while (true) : (importDescPtr += 1) {
+        const importDesc = importDescPtr[0];
         if (importDesc.OriginalFirstThunk == 0) break;
 
         const name: [*:0]u8 = @ptrCast(@alignCast(peMemory.ptr + importDesc.Name));
         std.debug.print("Import name: {s}\n", .{name});
 
-        const thunk_rva32: windows.DWORD =
-            if (importDesc.OriginalFirstThunk != 0)
-                importDesc.OriginalFirstThunk
-            else
-                importDesc.FirstThunk;
+        const libHandle: windows.HMODULE = windows.LoadLibraryA(name);
+        if (libHandle == null) {
+            const lastError = windows.GetLastError();
+            std.debug.print("LoadLibraryA failed: 0x{x}\n", .{lastError});
+            return LoadDllError.LoadLibraryFailed;
+        }
 
-        const thunkArrayPtr: [*]const pe.ImageThunkData = @ptrCast(@alignCast(peMemory.ptr + thunk_rva32));
+        const intRva: windows.DWORD = if (importDesc.OriginalFirstThunk != 0)
+            importDesc.OriginalFirstThunk
+        else
+            importDesc.FirstThunk;
+
+        const intThunkArray: [*]const pe.ImageThunkData = @ptrCast(@alignCast(peMemory.ptr + intRva));
+        const iatThunkArray: [*]pe.ImageThunkData = @ptrCast(@alignCast(peMemory.ptr + importDesc.FirstThunk));
+
         var thunkArrayIndex: usize = 0;
         while (true) : (thunkArrayIndex += 1) {
-            const thunkItem = thunkArrayPtr[thunkArrayIndex];
-            if (thunkItem.Function == 0) break;
+            const intThunkItem: *const pe.ImageThunkData = &intThunkArray[thunkArrayIndex];
+            const iatThunkItem: *pe.ImageThunkData = &iatThunkArray[thunkArrayIndex];
 
-            if (windows.IMAGE_SNAP_BY_ORDINAL(thunkItem.Function)) {
-                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(thunkItem.Function);
-                std.debug.print("   Import by ordinal: {}\n", .{ordinal});
+            if (intThunkItem.Function == 0) break;
+
+            var funcAddr: windows.ULONGLONG = 0;
+            if (windows.IMAGE_SNAP_BY_ORDINAL(intThunkItem.Function)) {
+                const ordinal: windows.ULONGLONG = windows.IMAGE_ORDINAL(intThunkItem.Function);
+                const ordinalWord: windows.WORD = @truncate(ordinal);
+                const procAddr = windows.GetProcAddress(libHandle, ordinalWord);
+                funcAddr = @intFromPtr(procAddr);
+                std.debug.print(" Import by ordinal: {} -> 0x{x}\n", .{ ordinalWord, funcAddr });
             } else {
-                const rva: usize = @intCast(thunkItem.AddressOfData & 0xFFFF_FFFF);
+                const rva: usize = @intCast(intThunkItem.AddressOfData & 0xFFFF_FFFF);
                 const importByName: *const pe.ImageImportByName = @ptrCast(@alignCast(peMemory.ptr + rva));
                 const namePtr: [*:0]const u8 = @ptrCast(&importByName.Name);
-                std.debug.print("   Import by name: {s} original hint: {}\n", .{ namePtr, importByName.Hint });
+                const procAddr = windows.GetProcAddress(libHandle, namePtr);
+                funcAddr = @intFromPtr(procAddr);
+                std.debug.print(" Import by name: {s} original hint: {} -> 0x{x}\n", .{ namePtr, importByName.Hint, funcAddr });
+            }
+
+            if (funcAddr != 0) {
+                iatThunkItem.Function = funcAddr;
             }
         }
     }
